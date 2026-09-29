@@ -17,6 +17,7 @@
 #include "clang/Basic/SourceLocation.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
 
 namespace clang {
 class ASTContext;
@@ -30,24 +31,33 @@ class BugSuppression {
 public:
   explicit BugSuppression(const ASTContext &ACtx) : ACtx(ACtx) {}
 
-  using DiagnosticIdentifierList = llvm::ArrayRef<llvm::StringRef>;
-
   /// Return true if the given bug report was explicitly suppressed by the user.
   bool isSuppressed(const BugReport &);
 
-  /// Return true if the bug reported at the given location was explicitly
-  /// suppressed by the user.
+  /// Return true if the bug reported at the given location, by the checker
+  /// with the given name, was explicitly suppressed by the user.
   bool isSuppressed(const PathDiagnosticLocation &Location,
-                    const Decl *DeclWithIssue,
-                    DiagnosticIdentifierList DiagnosticIdentification);
+                    const Decl *DeclWithIssue, llvm::StringRef CheckerName);
+
+  // A single `[[clang::suppress]]` annotation found in the source, together
+  // with the (possibly empty) list of checker names it was restricted to.
+  // An empty `CheckerNames` list means "suppress everything in this range",
+  // matching the attribute's traditional argument-less behavior.
+  //
+  // Exposed as an implementation detail so that BugSuppression.cpp's AST
+  // visitor can populate the cache below; not meant to be used elsewhere.
+  struct Suppression {
+    SourceRange Range;
+    llvm::SmallVector<llvm::StringRef, 2> CheckerNames;
+  };
 
 private:
   // Overly pessimistic number, to be honest.
   static constexpr unsigned EXPECTED_NUMBER_OF_SUPPRESSIONS = 8;
-  using CachedRanges =
-      llvm::SmallVector<SourceRange, EXPECTED_NUMBER_OF_SUPPRESSIONS>;
+  using CachedSuppressions =
+      llvm::SmallVector<Suppression, EXPECTED_NUMBER_OF_SUPPRESSIONS>;
 
-  llvm::DenseMap<const Decl *, CachedRanges> CachedSuppressionLocations;
+  llvm::DenseMap<const Decl *, CachedSuppressions> CachedSuppressionLocations;
 
   const ASTContext &ACtx;
 };

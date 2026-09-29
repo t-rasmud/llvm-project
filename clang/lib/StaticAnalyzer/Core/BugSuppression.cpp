@@ -19,24 +19,37 @@ using namespace ento;
 
 namespace {
 
-using Ranges = llvm::SmallVectorImpl<SourceRange>;
+using Suppressions = llvm::SmallVectorImpl<BugSuppression::Suppression>;
 
-inline bool hasSuppression(const Decl *D) {
-  // FIXME: Implement diagnostic identifier arguments
-  // (checker names, "hashtags").
-  if (const auto *Suppression = D->getAttr<SuppressAttr>())
-    return !Suppression->isGSL() &&
-           (Suppression->diagnosticIdentifiers().empty());
-  return false;
+// A checker name matches an identifier attached to `[[clang::suppress]]`
+// (e.g. "core.NullDereference") if the identifier names the checker exactly,
+// or names an enclosing package of it (e.g. "core" or "unix.Malloc" matching
+// "unix.MallocSizeof").
+inline bool checkerNameMatches(StringRef CheckerName, StringRef Identifier) {
+  if (!CheckerName.starts_with(Identifier))
+    return false;
+  return CheckerName.size() == Identifier.size() ||
+         CheckerName[Identifier.size()] == '.';
 }
-inline bool hasSuppression(const AttributedStmt *S) {
-  // FIXME: Implement diagnostic identifier arguments
-  // (checker names, "hashtags").
-  return llvm::any_of(S->getAttrs(), [](const Attr *A) {
-    const auto *Suppression = dyn_cast<SuppressAttr>(A);
-    return Suppression && !Suppression->isGSL() &&
-           (Suppression->diagnosticIdentifiers().empty());
-  });
+
+using SuppressAttrs = llvm::SmallVector<const SuppressAttr *, 2>;
+
+// A node may carry several [[clang::suppress]] attributes, and each of them
+// contributes its own identifiers.
+inline SuppressAttrs getSuppressions(const Decl *D) {
+  SuppressAttrs Result;
+  for (const auto *A : D->specific_attrs<SuppressAttr>())
+    if (!A->isGSL())
+      Result.push_back(A);
+  return Result;
+}
+inline SuppressAttrs getSuppressions(const AttributedStmt *S) {
+  SuppressAttrs Result;
+  for (const Attr *A : S->getAttrs())
+    if (const auto *Suppression = dyn_cast<SuppressAttr>(A))
+      if (!Suppression->isGSL())
+        Result.push_back(Suppression);
+  return Result;
 }
 
 template <class NodeType> inline SourceRange getRange(const NodeType *Node) {
@@ -82,7 +95,7 @@ inline bool fullyContains(SourceRange Larger, SourceRange Smaller,
 
 class CacheInitializer : public DynamicRecursiveASTVisitor {
 public:
-  static void initialize(const Decl *D, Ranges &ToInit) {
+  static void initialize(const Decl *D, Suppressions &ToInit) {
     CacheInitializer(ToInit).TraverseDecl(const_cast<Decl *>(D));
   }
 
@@ -103,29 +116,28 @@ public:
 
 private:
   template <class NodeType> bool VisitAttributedNode(NodeType *Node) {
-    if (hasSuppression(Node)) {
-      // TODO: In the future, when we come up with good stable IDs for checkers
-      //       we can return a list of kinds to ignore, or all if no arguments
-      //       were provided.
-      addRange(getRange(Node));
-    }
+    for (const SuppressAttr *Suppression : getSuppressions(Node))
+      addRange(getRange(Node),
+               ArrayRef(Suppression->diagnosticIdentifiers_begin(),
+                        Suppression->diagnosticIdentifiers_end()));
     // We should keep traversing AST.
     return true;
   }
 
-  void addRange(SourceRange R) {
+  void addRange(SourceRange R, ArrayRef<StringRef> Names) {
     if (R.isValid()) {
-      Result.push_back(R);
+      Result.push_back(
+          BugSuppression::Suppression{R, {Names.begin(), Names.end()}});
     }
   }
 
-  CacheInitializer(Ranges &R) : Result(R) {
+  CacheInitializer(Suppressions &R) : Result(R) {
     ShouldVisitTemplateInstantiations = true;
     ShouldWalkTypesOfTypeLocs = false;
     ShouldVisitImplicitCode = false;
     ShouldVisitLambdaBody = true;
   }
-  Ranges &Result;
+  Suppressions &Result;
 };
 
 std::string timeScopeName(const Decl *DeclWithIssue) {
@@ -153,18 +165,14 @@ llvm::TimeTraceMetadata getDeclTimeTraceMetadata(const Decl *DeclWithIssue) {
 
 } // end anonymous namespace
 
-// TODO: Introduce stable IDs for checkers and check for those here
-//       to be more specific.  Attribute without arguments should still
-//       be considered as "suppress all".
-//       It is already much finer granularity than what we have now
-//       (i.e. removing the whole function from the analysis).
 bool BugSuppression::isSuppressed(const BugReport &R) {
   PathDiagnosticLocation Location = R.getLocation();
   PathDiagnosticLocation UniqueingLocation = R.getUniqueingLocation();
   const Decl *DeclWithIssue = R.getDeclWithIssue();
+  StringRef CheckerName = R.getBugType().getCheckerName();
 
-  return isSuppressed(Location, DeclWithIssue, {}) ||
-         isSuppressed(UniqueingLocation, DeclWithIssue, {});
+  return isSuppressed(Location, DeclWithIssue, CheckerName) ||
+         isSuppressed(UniqueingLocation, DeclWithIssue, CheckerName);
 }
 
 static const ClassTemplateDecl *
@@ -269,7 +277,7 @@ preferTemplateDefinitionForTemplateSpecializations(const Decl *D) {
 
 bool BugSuppression::isSuppressed(const PathDiagnosticLocation &Location,
                                   const Decl *DeclWithIssue,
-                                  DiagnosticIdentifierList Hashtags) {
+                                  StringRef CheckerName) {
   if (!Location.isValid())
     return false;
 
@@ -317,21 +325,29 @@ bool BugSuppression::isSuppressed(const PathDiagnosticLocation &Location,
   // large functions with a lot of bugs it can make a dent in performance.
   // In order to avoid this scenario, we cache traversal results.
   auto InsertionResult = CachedSuppressionLocations.insert(
-      std::make_pair(DeclWithIssue, CachedRanges{}));
-  Ranges &SuppressionRanges = InsertionResult.first->second;
+      std::make_pair(DeclWithIssue, CachedSuppressions{}));
+  CachedSuppressions &DeclSuppressions = InsertionResult.first->second;
   if (InsertionResult.second) {
     llvm::TimeTraceScope TimeScope(
         timeScopeName(DeclWithIssue),
         [DeclWithIssue]() { return getDeclTimeTraceMetadata(DeclWithIssue); });
     // We haven't checked this declaration for suppressions yet!
-    CacheInitializer::initialize(DeclWithIssue, SuppressionRanges);
+    CacheInitializer::initialize(DeclWithIssue, DeclSuppressions);
   }
 
   SourceRange BugRange = Location.asRange();
   const SourceManager &SM = Location.getManager();
 
-  return llvm::any_of(SuppressionRanges,
-                      [BugRange, &SM](SourceRange Suppression) {
-                        return fullyContains(Suppression, BugRange, SM);
-                      });
+  return llvm::any_of(
+      DeclSuppressions, [&](const Suppression &S) {
+        if (!fullyContains(S.Range, BugRange, SM))
+          return false;
+        // An empty checker-name list means the suppression applies to
+        // every checker (the attribute's traditional argument-less form).
+        if (S.CheckerNames.empty())
+          return true;
+        return llvm::any_of(S.CheckerNames, [&](StringRef Identifier) {
+          return checkerNameMatches(CheckerName, Identifier);
+        });
+      });
 }
