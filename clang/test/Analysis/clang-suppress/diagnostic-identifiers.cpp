@@ -15,16 +15,13 @@ void bare_suppress() {
 }
 
 void suppress_with_identifier() {
-  // FIXME: This should suppress debug.ExprInspection warnings, but currently
-  // any identifier makes the suppression a no-op.
   [[clang::suppress("debug.ExprInspection")]] {
-    clang_analyzer_warnIfReached(); // expected-warning{{REACHABLE}}
+    clang_analyzer_warnIfReached(); // no-warning: checker name matches
   }
 }
 
 void suppress_with_wrong_identifier() {
-  // Even with the wrong checker name, the current behavior is the same:
-  // any identifier makes the suppression a no-op.
+  // A non-matching checker name does not suppress the report.
   [[clang::suppress("alpha.SomeOtherChecker")]] {
     clang_analyzer_warnIfReached(); // expected-warning{{REACHABLE}}
   }
@@ -38,9 +35,8 @@ void suppress_with_wrong_identifier() {
   clang_analyzer_warnIfReached(); // no-warning
 }
 
-// FIXME: Should suppress, but currently identifiers disable suppression.
 [[clang::suppress("debug.ExprInspection")]] void decl_with_identifier() {
-  clang_analyzer_warnIfReached(); // expected-warning{{REACHABLE}}
+  clang_analyzer_warnIfReached(); // no-warning
 }
 
 // ============================================================================
@@ -53,7 +49,7 @@ struct [[clang::suppress]] C_BareSuppressedClass {
   }
 };
 
-// FIXME: Should suppress, but identifiers disable suppression.
+// "core" does not name debug.ExprInspection's package, so no suppression.
 struct [[clang::suppress("core")]] C_IdentifierSuppressedClass {
   void method() {
     clang_analyzer_warnIfReached(); // expected-warning{{REACHABLE}}
@@ -65,9 +61,13 @@ struct [[clang::suppress("core")]] C_IdentifierSuppressedClass {
 // ============================================================================
 
 void multiple_identifiers() {
-  // FIXME: Multiple identifiers — currently treated as a no-op.
+  // None of the identifiers match debug.ExprInspection.
   [[clang::suppress("core.NullDereference", "core.DivideZero")]] {
     clang_analyzer_warnIfReached(); // expected-warning{{REACHABLE}}
+  }
+  // Any one matching identifier is enough.
+  [[clang::suppress("core.DivideZero", "debug.ExprInspection")]] {
+    clang_analyzer_warnIfReached(); // no-warning
   }
 }
 
@@ -76,7 +76,7 @@ void multiple_identifiers() {
 // ============================================================================
 
 void empty_string_identifier() {
-  // An empty string is still a non-empty identifier list.
+  // An empty string is still a non-empty identifier list and matches nothing.
   [[clang::suppress("")]] {
     clang_analyzer_warnIfReached(); // expected-warning{{REACHABLE}}
   }
@@ -91,9 +91,8 @@ void mixed_suppressions() {
     clang_analyzer_warnIfReached(); // no-warning: bare suppress works
   }
 
-  // FIXME: Should suppress too, but identifiers disable it.
   [[clang::suppress("debug.ExprInspection")]] {
-    clang_analyzer_warnIfReached(); // expected-warning{{REACHABLE}}
+    clang_analyzer_warnIfReached(); // no-warning
   }
 }
 
@@ -107,9 +106,66 @@ namespace [[clang::suppress]] G_BareNS {
   }
 } // namespace G_BareNS
 
-// FIXME: Should suppress, but identifiers disable it.
-namespace [[clang::suppress("core")]] G_IdentifierNS {
+namespace [[clang::suppress("debug.ExprInspection")]] G_IdentifierNS {
   void func() {
-    clang_analyzer_warnIfReached(); // expected-warning{{REACHABLE}}
+    clang_analyzer_warnIfReached(); // no-warning
   }
 } // namespace G_IdentifierNS
+
+// ============================================================================
+// Group H: Package-prefix matching
+// ============================================================================
+
+void package_prefix() {
+  // A package name suppresses every checker in that package.
+  [[clang::suppress("debug")]] {
+    clang_analyzer_warnIfReached(); // no-warning
+  }
+}
+
+void partial_component_does_not_match() {
+  // Matching is on '.'-separated components, not raw string prefixes.
+  [[clang::suppress("debug.Expr")]] {
+    clang_analyzer_warnIfReached(); // expected-warning{{REACHABLE}}
+  }
+  [[clang::suppress("deb")]] {
+    clang_analyzer_warnIfReached(); // expected-warning{{REACHABLE}}
+  }
+}
+
+void identifier_longer_than_checker_name() {
+  [[clang::suppress("debug.ExprInspection.Extra")]] {
+    clang_analyzer_warnIfReached(); // expected-warning{{REACHABLE}}
+  }
+}
+
+// ============================================================================
+// Group I: Real checkers
+// ============================================================================
+
+int null_deref_matching() {
+  int *p = 0;
+  [[clang::suppress("core.NullDereference")]]
+  return *p; // no-warning
+}
+
+int null_deref_package() {
+  int *p = 0;
+  [[clang::suppress("core")]]
+  return *p; // no-warning
+}
+
+int null_deref_other_checker() {
+  int *p = 0;
+  [[clang::suppress("core.DivideZero")]]
+  return *p; // expected-warning{{Dereference of null pointer}}
+}
+
+int only_matching_checker_suppressed(int x) {
+  int *p = 0;
+  [[clang::suppress("core.NullDereference")]] {
+    if (x == 0)
+      return 1 / x; // expected-warning{{Division by zero}}
+  }
+  return *p; // expected-warning{{Dereference of null pointer}}
+}
